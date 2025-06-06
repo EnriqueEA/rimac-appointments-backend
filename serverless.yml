@@ -1,0 +1,256 @@
+service: tutorial-serverless
+
+plugins:
+  - serverless-iam-roles-per-function
+  - serverless-auto-swagger
+  - serverless-offline
+
+package:
+  patterns:
+    - swagger/**
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: us-east-1
+  environment:
+    # DynamoDB
+    DYNAMODB_APPOINTMENT_TABLE: ${self:service}-appointmentTable-${sls:stage}
+    # SNS Topics
+    SNS_APPOINTMENTS_TOPIC_ARN_PE: !Ref AppointmentTopicPE
+    SNS_APPOINTMENTS_TOPIC_ARN_CL: !Ref AppointmentTopicCL
+    # Variables de entorno para colas SQS
+    SQS_APPOINTMENTS_PE_URL: !Ref AppointmentQueuePE
+    SQS_APPOINTMENTS_CL_URL: !Ref AppointmentQueueCL
+    SQS_COMPLETIONS_URL: !Ref CompletionQueue
+    # MySQL Database
+    DB_HOST: ${env:DB_HOST, 'localhost'}
+    DB_PORT: ${env:DB_PORT, '3306'}
+    DB_USER: ${env:DB_USER, 'root'}
+    DB_PASS: ${env:DB_PASS}
+    DB_NAME_PE: ${env:DB_NAME_PE, 'appointments_peru'}
+    DB_NAME_CL: ${env:DB_NAME_CL, 'appointments_chile'}
+    # EventBridge
+    EVENTBRIDGE_COMPLETION_BUS: !Ref CompletionEventBus
+
+functions:
+  appointment:
+    handler: src/presentation/controllers/appointment.handler
+    events:
+      - http:
+          path: /
+          method: post
+          bodyType: CreateAppointmentDTO
+      - http:
+          path: /appointments/{insuredId}
+          method: get
+          responseData:
+            200:
+              description: 'List of appointments for the insured'
+              bodyType: AppointmentList
+      - sqs:
+          arn: !GetAtt CompletionQueue.Arn
+    iamRoleStatements:
+      - Effect: 'Allow'
+        Action:
+          - 'dynamodb:GetItem'
+          - 'dynamodb:PutItem'
+          - 'dynamodb:UpdateItem'
+        Resource: !GetAtt AppointmentTable.Arn
+      - Effect: 'Allow'
+        Action:
+          - 'dynamodb:Query'
+        Resource:
+          - !Sub '${AppointmentTable.Arn}/index/insuredId-index'
+      - Effect: 'Allow'
+        Action:
+          - 'sns:Publish'
+        Resource:
+          - !Ref AppointmentTopicPE
+          - !Ref AppointmentTopicCL
+
+  appointment_pe:
+    handler: src/presentation/controllers/appointment_pe.handler
+    events:
+      - sqs:
+          arn: !GetAtt AppointmentQueuePE.Arn
+    iamRoleStatements:
+      - Effect: 'Allow'
+        Action:
+          - 'events:PutEvents'
+        Resource:
+          - !GetAtt CompletionEventBus.Arn
+      - Effect: 'Allow'
+        Action:
+          - 'sqs:ReceiveMessage'
+          - 'sqs:DeleteMessage'
+          - 'sqs:GetQueueAttributes'
+        Resource:
+          - !GetAtt AppointmentQueuePE.Arn
+
+  appointment_cl:
+    handler: src/presentation/controllers/appointment_cl.handler
+    events:
+      - sqs:
+          arn: !GetAtt AppointmentQueueCL.Arn
+    iamRoleStatements:
+      - Effect: 'Allow'
+        Action:
+          - 'events:PutEvents'
+        Resource:
+          - !GetAtt CompletionEventBus.Arn
+      - Effect: 'Allow'
+        Action:
+          - 'sqs:ReceiveMessage'
+          - 'sqs:DeleteMessage'
+          - 'sqs:GetQueueAttributes'
+        Resource:
+          - !GetAtt AppointmentQueueCL.Arn
+
+resources:
+  Resources:
+    # DynamoDB
+    AppointmentTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.DYNAMODB_APPOINTMENT_TABLE}
+        AttributeDefinitions:
+          - AttributeName: appointmentId
+            AttributeType: 'S'
+          - AttributeName: insuredId
+            AttributeType: 'S'
+        BillingMode: PAY_PER_REQUEST
+        KeySchema:
+          - AttributeName: appointmentId
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: insuredId-index
+            KeySchema:
+              - AttributeName: insuredId
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+
+    # SNS Topics
+    AppointmentTopicPE:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:service}-appointments-pe-${sls:stage}
+
+    AppointmentTopicCL:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:service}-appointments-cl-${sls:stage}
+
+    # SQS Queues
+    AppointmentQueuePE:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-SQS-PE-${sls:stage}
+        VisibilityTimeout: 300
+
+    AppointmentQueueCL:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-SQS-CL-${sls:stage}
+        VisibilityTimeout: 300
+
+    CompletionQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-completions-${sls:stage}
+        VisibilityTimeout: 300
+
+    # SNS Subscriptions
+    AppointmentSubscriptionPE:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref AppointmentTopicPE
+        Protocol: sqs
+        Endpoint: !GetAtt AppointmentQueuePE.Arn
+        FilterPolicy:
+          countryISO: ['PE']
+
+    AppointmentSubscriptionCL:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref AppointmentTopicCL
+        Protocol: sqs
+        Endpoint: !GetAtt AppointmentQueueCL.Arn
+        FilterPolicy:
+          countryISO: ['CL']
+
+    # SQS Queue Policies to allow SNS to send messages
+    AppointmentQueuePEPolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref AppointmentQueuePE
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: sns.amazonaws.com
+              Action:
+                - sqs:SendMessage
+              Resource: !GetAtt AppointmentQueuePE.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !Ref AppointmentTopicPE
+
+    AppointmentQueueCLPolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref AppointmentQueueCL
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: sns.amazonaws.com
+              Action:
+                - sqs:SendMessage
+              Resource: !GetAtt AppointmentQueueCL.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !Ref AppointmentTopicCL
+
+    # EventBridge Bus
+    CompletionEventBus:
+      Type: AWS::Events::EventBus
+      Properties:
+        Name: ${self:service}-completion-bus-${sls:stage}
+
+    # EventBridge Rule to send events to CompletionQueue
+    CompletionEventRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-completion-event-rule-${sls:stage}
+        EventBusName: !Ref CompletionEventBus
+        EventPattern:
+          source:
+            - 'appointment.completion'
+        Targets:
+          - Arn: !GetAtt CompletionQueue.Arn
+            Id: 'CompletionQueueTarget'
+
+    # Allow EventBridge to send messages to CompletionQueue
+    CompletionQueueEventBridgePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref CompletionQueue
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: events.amazonaws.com
+              Action: sqs:SendMessage
+              Resource: !GetAtt CompletionQueue.Arn
+
+custom:
+  autoswagger:
+    title: 'Serverless Appointment Service'
+    apiType: 'http'
+    version: '1.0.0'
+    basePath: '/dev'
